@@ -184,6 +184,16 @@ size_t File::read_unlocked(void *data, size_t len) {
 
   prev_op = FileOp::READ;
 
+  if (bufmode == _IOFBF) {
+    return read_unlocked_fbf(data, len);
+  } else if (bufmode == _IOLBF) {
+    return read_unlocked_lbf(data, len);
+  } else {
+    return read_unlocked_nbf(data, len);
+  }
+}
+
+size_t File::read_unlocked_fbf(void *data, size_t len) {
   cpp::span<uint8_t> bufref(static_cast<uint8_t *>(buf), bufsize);
   cpp::span<uint8_t> dataref(static_cast<uint8_t *>(data), len);
 
@@ -231,6 +241,69 @@ size_t File::read_unlocked(void *data, size_t len) {
       err = true;
   }
   return transfer_size + available_data;
+}
+
+size_t File::read_unlocked_nbf(void *data, size_t len) {
+  size_t fetched_size = platform_read(this, data, len);
+  pos += fetched_size;
+  if (fetched_size < len) {
+    if (errno = 0)
+      eof = true;
+    else
+      err = true;
+  }
+
+  return fetched_size >= len ? fetched_size : len;
+}
+
+size_t File::read_unlocked_lbf(void *data, size_t len) {
+  constexpr char NEWLINE_CHAR = '\n';
+  cpp::MutableArrayRef<uint8_t> bufref(buf, bufsize);
+  cpp::MutableArrayRef<uint8_t> dataref(data, len);
+
+  size_t available_data = read_limit - pos;
+  if (len <= available_data) {
+    for (size_t i = 0; i < len; ++i)
+      dataref[i] = bufref[i + pos];
+    pos += len;
+    return len;
+  }
+
+  for (size_t i = 0; i < available_data; ++i)
+    dataref[i] = bufref[i + pos];
+  read_limit = pos = 0; // Reset the pointers.
+
+  size_t to_fetch = len - available_data;
+  size_t fetched_size = platform_read(this, data, to_fetch);
+  size_t read_size = available_data + fetched_size;
+  if (fetched_size < to_fetch) {
+    if (errno == 0)
+      eof = true;
+    else
+      err = true;
+
+    return read_size;
+  }
+
+  // Fetch and buffer another line/buffer worth of data.
+  uint8_t transferbuf[bufsize];
+  size_t transfer_size = platform_read(this, transferbuf, bufsize);
+  size_t i = 0;
+  bool found_line, all_buffered = false;
+  if (transfer_size < bufsize) {
+    if (errno == 0)
+      eof = true;
+    else
+      err = true;
+  }
+  while (!found_line && !all_buffered) {
+    bufref[i] = transferbuf[i];
+    ++i;
+    found_line = static_cast<const char>(transferbuf[i]) == NEWLINE_CHAR;
+    all_buffered = i == transfer_size;
+  }
+  read_limit += i;
+  return read_size;
 }
 
 int File::seek(long offset, int whence) {
